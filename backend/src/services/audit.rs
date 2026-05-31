@@ -6,6 +6,7 @@
 use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::{Json, Router, routing::post};
+use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tracing::{info, instrument};
@@ -56,6 +57,89 @@ impl AuditService {
 
         info!(event_type = %event.event_type, "Audit event logged");
         Ok(())
+    }
+
+    /// Search audit logs with optional filters.
+    #[instrument(skip(self))]
+    pub async fn search_audit_logs(
+        &self,
+        event_type: Option<String>,
+        user_id: Option<String>,
+        start_time: Option<chrono::DateTime<chrono::Utc>>,
+        end_time: Option<chrono::DateTime<chrono::Utc>>,
+        limit: Option<i64>,
+    ) -> Result<Vec<AuditEvent>, AppError> {
+        let mut query = String::from(
+            r#"SELECT event_type, user_id, details, timestamp FROM audit_logs WHERE 1=1"#
+        );
+        let mut params = Vec::new();
+        let mut param_index = 1;
+        
+        if let Some(event_type) = event_type {
+            query.push_str(&format!(" AND event_type = ${}::TEXT", param_index));
+            params.push(event_type);
+            param_index += 1;
+        }
+        
+        if let Some(user_id) = user_id {
+            query.push_str(&format!(" AND user_id = ${}", param_index));
+            params.push(user_id);
+            param_index += 1;
+        }
+        
+        if let Some(start_time) = start_time {
+            query.push_str(&format!(" AND timestamp >= ${}", param_index));
+            params.push(start_time);
+            param_index += 1;
+        }
+        
+        if let Some(end_time) = end_time {
+            query.push_str(&format!(" AND timestamp <= ${}", param_index));
+            params.push(end_time);
+            param_index += 1;
+        }
+        
+        query.push_str(" ORDER BY timestamp DESC");
+        
+        if let Some(limit) = limit {
+            query.push_str(&format!(" LIMIT {}", limit));
+        }
+        
+        let rows = sqlx::query(&query)
+            .bind_all(params)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::db(e))?;
+        
+        let mut results = Vec::new();
+        for row in rows {
+            let event_type_str = row.get::<&str, _>("event_type");
+            let event_type = match event_type_str {
+                "authentication" => AuditEventType::Authentication,
+                "authorization" => AuditEventType::Authorization,
+                "data_access" => AuditEventType::DataAccess,
+                "configuration_change" => AuditEventType::ConfigurationChange,
+                "maintenance" => AuditEventType::Maintenance,
+                "security_incident" => AuditEventType::SecurityIncident,
+                "api_access" => AuditEventType::ApiAccess,
+                s if s.starts_with("custom:") => {
+                    let custom_name = s[7..].to_string();
+                    AuditEventType::Custom(custom_name)
+                }
+                _ => continue,
+            };
+            
+            let event = AuditEvent {
+                event_type,
+                user_id: row.get::<Option<String>, _>("user_id"),
+                details: serde_json::from_value(row.get::<serde_json::Value, _>("details"))
+                    .map_err(|e| AppError::serialization(e))?,
+                timestamp: row.get::<chrono::DateTime<chrono::Utc>, _>("timestamp"),
+            };
+            results.push(event);
+        }
+        
+        Ok(results)
     }
 }
 
