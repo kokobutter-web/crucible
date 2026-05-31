@@ -6,6 +6,7 @@
 use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::{Json, Router, routing::post};
+use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tracing::{info, instrument};
@@ -56,6 +57,24 @@ impl AuditService {
 
         info!(event_type = %event.event_type, "Audit event logged");
         Ok(())
+    }
+
+    /// Remove audit logs older than the retention period.
+    #[instrument(skip(self))]
+    pub async fn prune_old_audit_logs(&self, retention_days: i64) -> Result<u64, AppError> {
+        let cutoff = Utc::now() - Duration::days(retention_days);
+
+        let deleted = sqlx::query!(
+            r#"DELETE FROM audit_logs WHERE timestamp < $1"#,
+            cutoff,
+        )
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::db(e))?
+        .rows_affected();
+
+        info!(deleted, retention_days, "Pruned old audit logs");
+        Ok(deleted)
     }
 }
 
