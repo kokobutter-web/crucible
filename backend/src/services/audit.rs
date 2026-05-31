@@ -2,10 +2,12 @@
 //!
 //! This module provides async audit logging for security events using Axum, SQLx (PostgreSQL), and Redis.
 //! It follows Rust best practices, includes tracing, and integrates with project error handling.
+//! Implements comprehensive audit event types and validation (Issue #410).
 
 use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::{Json, Router, routing::post};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tracing::{info, instrument};
@@ -14,9 +16,45 @@ use std::sync::Arc;
 
 use crate::error::AppError;
 
+/// Comprehensive audit event types for security logging
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
+pub enum AuditEventType {
+    /// User authentication events
+    Authentication,
+    /// User authorization events
+    Authorization,
+    /// Data access events
+    DataAccess,
+    /// Configuration changes
+    ConfigurationChange,
+    /// System maintenance events
+    Maintenance,
+    /// Security incident detection
+    SecurityIncident,
+    /// API access events
+    ApiAccess,
+    /// Custom event type
+    Custom(String),
+}
+
+impl std::fmt::Display for AuditEventType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuditEventType::Authentication => write!(f, "authentication"),
+            AuditEventType::Authorization => write!(f, "authorization"),
+            AuditEventType::DataAccess => write!(f, "data_access"),
+            AuditEventType::ConfigurationChange => write!(f, "configuration_change"),
+            AuditEventType::Maintenance => write!(f, "maintenance"),
+            AuditEventType::SecurityIncident => write!(f, "security_incident"),
+            AuditEventType::ApiAccess => write!(f, "api_access"),
+            AuditEventType::Custom(s) => write!(f, "custom:{}", s),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AuditEvent {
-    pub event_type: String,
+    pub event_type: AuditEventType,
     pub user_id: Option<String>,
     pub details: serde_json::Value,
     pub timestamp: chrono::DateTime<chrono::Utc>,
@@ -40,7 +78,7 @@ impl AuditService {
         sqlx::query!(
             r#"INSERT INTO audit_logs (event_type, user_id, details, timestamp)
                VALUES ($1, $2, $3, $4)"#,
-            event.event_type,
+            event.event_type.to_string(),
             event.user_id,
             event.details,
             event.timestamp
@@ -60,7 +98,9 @@ impl AuditService {
 }
 
 #[derive(Debug, Deserialize)]
+/// Request payload for audit event logging with validation
 pub struct AuditEventRequest {
+    /// Event type (must be one of: authentication, authorization, data_access, configuration_change, maintenance, security_incident, api_access, or custom:<name>)
     pub event_type: String,
     pub user_id: Option<String>,
     pub details: serde_json::Value,
@@ -72,8 +112,24 @@ pub async fn log_audit_event(
     State(service): State<Arc<AuditService>>,
     Json(payload): Json<AuditEventRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    // Validate and parse event type
+    let event_type = match payload.event_type.as_str() {
+        "authentication" => AuditEventType::Authentication,
+        "authorization" => AuditEventType::Authorization,
+        "data_access" => AuditEventType::DataAccess,
+        "configuration_change" => AuditEventType::ConfigurationChange,
+        "maintenance" => AuditEventType::Maintenance,
+        "security_incident" => AuditEventType::SecurityIncident,
+        "api_access" => AuditEventType::ApiAccess,
+        s if s.starts_with("custom:") => {
+            let custom_name = s[7..].to_string();
+            AuditEventType::Custom(custom_name)
+        }
+        _ => return Err(AppError::validation("Invalid audit event type")),
+    };
+    
     let event = AuditEvent {
-        event_type: payload.event_type,
+        event_type,
         user_id: payload.user_id,
         details: payload.details,
         timestamp: chrono::Utc::now(),
